@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Single local Grok image MCP.
+
+grok-image-mcp speaks stdio only, so each client would otherwise spawn its own
+process. This command keeps one child process and exposes it at
+http://127.0.0.1:9371/mcp. Agents use this command instead of launching the
+binary themselves.
+"""
+
+import json
+import os
+import queue
+import signal
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOST = "127.0.0.1"
+PORT = 9371
+URL = f"http://{HOST}:{PORT}/mcp"
+ROOT = Path(__file__).resolve().parent.parent
+BIN = ROOT / "bin" / "grok-image-mcp"
+STATE = ROOT / "var"
+OUTPUT = ROOT / "output"
+PIDFILE = STATE / "server.pid"
+LOGFILE = STATE / "server.log"
+LOCKFILE = STATE / "start.lock"
+
+MCP_ENV = {
+    "GROK_IMAGE_AUTH": "oauth",
+    "GROK_IMAGE_MODEL": "grok-imagine-image-quality",
+    "GROK_IMAGES_DIR": str(OUTPUT),
+}
+
+CALL_TIMEOUT = 700
+MAX_BODY = 8 * 1024 * 1024
+
+mcp_proc = None
+stdin_lock = threading.Lock()
+call_lock = threading.Lock()
+waiters_lock = threading.Lock()
+waiters = {}
+next_id = 1
+init_result = None
+
+
+def mcp_env():
+    env = os.environ.copy()
+    env.update(MCP_ENV)
+    return env
+
+
+def log(message):
+    sys.stderr.write(message.rstrip() + "\n")
+    sys.stderr.flush()
+
+
+def health():
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{PORT}/health", timeout=1) as response:
+            if response.status != 200:
+                return None
+            return json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def read_pid():
+    try:
+        return int(PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_is_serve(pid):
+    try:
+        command = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return "grok-image" in command and "serve" in command
+
+
+def tail_log():
+    try:
+        lines = LOGFILE.read_text(errors="replace").splitlines()[-40:]
+    except OSError:
+        return
+    if lines:
+        sys.stderr.write("\n".join(lines) + "\n")
+
+
+def print_status(payload, code=0):
+    print(json.dumps(payload, ensure_ascii=False))
+    return code
+
+
+def cmd_status():
+    info = health()
+    if info:
+        return print_status({"running": True, "url": URL, "pid": info.get("pid")})
+    return print_status({"running": False, "url": URL})
+
+
+def cmd_start():
+    if health():
+        return cmd_status()
+    STATE.mkdir(parents=True, exist_ok=True)
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCKFILE, "a")
+    import fcntl
+
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        if health():
+            return cmd_status()
+        log_handle = open(LOGFILE, "ab", buffering=0)
+        script = str(Path(__file__).resolve())
+        child = subprocess.Popen(
+            [sys.executable, script, "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(ROOT),
+        )
+        for _ in range(50):
+            if health():
+                return cmd_status()
+            if child.poll() is not None:
+                break
+            import time
+
+            time.sleep(0.2)
+        if child.poll() is None:
+            child.terminate()
+        log("grok-image failed to start")
+        tail_log()
+        return 1
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def cmd_stop():
+    info = health()
+    pid = info.get("pid") if info else read_pid()
+    if pid and pid_is_serve(pid):
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(25):
+            if not health() and not pid_is_serve(pid):
+                break
+            import time
+
+            time.sleep(0.2)
+    try:
+        PIDFILE.unlink()
+    except OSError:
+        pass
+    return print_status({"running": False, "url": URL})
+
+
+def ensure():
+    if health():
+        return 0
+    return cmd_start()
+
+
+def post(payload, timeout):
+    data = json.dumps(payload).encode()
+    request = urllib.request.Request(
+        URL,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+        if not raw:
+            return None
+        return json.loads(raw)
+
+
+def cmd_tools(as_json):
+    code = ensure()
+    if code:
+        return code
+    response = post({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, 30)
+    tools = (response or {}).get("result", {}).get("tools", [])
+    if as_json:
+        print(json.dumps(tools, ensure_ascii=False, indent=2))
+        return 0
+    for tool in tools:
+        schema = tool.get("inputSchema") or {}
+        properties = list((schema.get("properties") or {}).keys())
+        required = schema.get("required") or []
+        description = (tool.get("description") or "").split("\n", 1)[0]
+        print(tool.get("name", ""))
+        print(f"  {description}")
+        print(f"  args: {', '.join(properties) or '-'}")
+        print(f"  required: {', '.join(required) or '-'}")
+    return 0
+
+
+def load_arguments(argv):
+    if argv:
+        return json.loads(" ".join(argv))
+    if not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+        return json.loads(text) if text else {}
+    return {}
+
+
+def cmd_call(tool, argv):
+    try:
+        arguments = load_arguments(argv)
+    except json.JSONDecodeError as exc:
+        log(f"invalid JSON arguments: {exc}")
+        return 1
+    code = ensure()
+    if code:
+        return code
+    response = post(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        },
+        CALL_TIMEOUT,
+    )
+    if not response:
+        log("empty MCP response")
+        return 1
+    if "error" in response:
+        log(json.dumps(response["error"], ensure_ascii=False))
+        return 1
+    result = response.get("result") or {}
+    texts = [
+        item.get("text", "")
+        for item in result.get("content") or []
+        if item.get("type") == "text"
+    ]
+    output = "\n".join(texts) if texts else json.dumps(result, ensure_ascii=False)
+    if result.get("isError"):
+        log(output)
+        return 1
+    print(output)
+    return 0
+
+
+def allocate_id():
+    global next_id
+    value = next_id
+    next_id += 1
+    return value
+
+
+def reader():
+    assert mcp_proc is not None and mcp_proc.stdout is not None
+    for line in mcp_proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"ignored non-JSON stdout: {line[:200]}")
+            continue
+        message_id = message.get("id")
+        if message_id is None:
+            continue
+        with waiters_lock:
+            waiter = waiters.pop(message_id, None)
+        if waiter is not None:
+            waiter.put(message)
+
+
+def forward(method, params, timeout):
+    if mcp_proc is None or mcp_proc.poll() is not None:
+        raise RuntimeError("grok-image-mcp is not running")
+    message_id = allocate_id()
+    waiter = queue.Queue(1)
+    payload = {"jsonrpc": "2.0", "id": message_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    with waiters_lock:
+        waiters[message_id] = waiter
+    with stdin_lock:
+        assert mcp_proc.stdin is not None
+        mcp_proc.stdin.write(json.dumps(payload) + "\n")
+        mcp_proc.stdin.flush()
+    try:
+        return waiter.get(timeout=timeout)
+    except queue.Empty:
+        with waiters_lock:
+            waiters.pop(message_id, None)
+        raise TimeoutError(f"{method} timed out after {timeout}s")
+
+
+def notify(method):
+    if mcp_proc is None or mcp_proc.poll() is not None:
+        raise RuntimeError("grok-image-mcp is not running")
+    with stdin_lock:
+        assert mcp_proc.stdin is not None
+        mcp_proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method}) + "\n")
+        mcp_proc.stdin.flush()
+
+
+def stop_child(signum, _frame):
+    if mcp_proc is not None and mcp_proc.poll() is None:
+        mcp_proc.terminate()
+    os._exit(0)
+
+
+def cmd_serve():
+    global mcp_proc, init_result
+    if not BIN.is_file():
+        log(f"missing binary: {BIN}")
+        return 1
+    STATE.mkdir(parents=True, exist_ok=True)
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    PIDFILE.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, stop_child)
+    signal.signal(signal.SIGINT, stop_child)
+    mcp_log = open(LOGFILE, "a", buffering=1)
+    mcp_proc = subprocess.Popen(
+        [str(BIN)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=mcp_log,
+        env=mcp_env(),
+        text=True,
+        bufsize=1,
+    )
+    threading.Thread(target=reader, name="grok-image-reader", daemon=True).start()
+    try:
+        initialized = forward(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "grok-image", "version": "1"},
+            },
+            30,
+        )
+    except Exception as exc:
+        log(f"initialize failed: {exc}")
+        mcp_proc.terminate()
+        return 1
+    if "error" in initialized:
+        log(json.dumps(initialized["error"], ensure_ascii=False))
+        mcp_proc.terminate()
+        return 1
+    init_result = initialized.get("result")
+    notify("notifications/initialized")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            log("%s - " % self.address_string() + fmt % args)
+
+        def send_json(self, status, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.split("?", 1)[0] != "/health":
+                self.send_json(404, {"ok": False})
+                return
+            alive = mcp_proc is not None and mcp_proc.poll() is None
+            self.send_json(200 if alive else 503, {"ok": alive, "pid": os.getpid()})
+
+        def do_POST(self):
+            if self.path.split("?", 1)[0] != "/mcp":
+                self.send_json(404, {"ok": False})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > MAX_BODY:
+                self.send_json(413, {"error": "body too large"})
+                return
+            try:
+                message = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            if isinstance(message, list):
+                self.send_json(400, {"error": "JSON-RPC batches are not supported"})
+                return
+            method = message.get("method")
+            if method and method.startswith("notifications/"):
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                if method == "initialize":
+                    reply = {"jsonrpc": "2.0", "id": message.get("id"), "result": init_result}
+                else:
+                    timeout = CALL_TIMEOUT if method == "tools/call" else 60
+                    with call_lock:
+                        reply = forward(method, message.get("params"), timeout)
+                    if "id" in message:
+                        reply["id"] = message["id"]
+            except Exception as exc:
+                log(f"{method} failed: {exc}")
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "error": {"code": -32000, "message": str(exc)},
+                }
+            self.send_json(200, reply)
+
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as exc:
+        log(f"cannot listen on {HOST}:{PORT}: {exc}")
+        mcp_proc.terminate()
+        return 1
+    server.daemon_threads = True
+    log(f"grok-image listening on {URL}")
+    server.serve_forever()
+    return 0
+
+
+def usage():
+    log(
+        "usage:\n"
+        "  grok-image status\n"
+        "  grok-image start\n"
+        "  grok-image stop\n"
+        "  grok-image tools [--json]\n"
+        "  grok-image call <tool> '<json>'"
+    )
+    return 2
+
+
+def main(argv):
+    if len(argv) < 2:
+        return usage()
+    command = argv[1]
+    if command == "status":
+        return cmd_status()
+    if command == "start":
+        return cmd_start()
+    if command == "stop":
+        return cmd_stop()
+    if command == "serve":
+        return cmd_serve()
+    if command == "tools":
+        return cmd_tools("--json" in argv[2:])
+    if command == "call":
+        if len(argv) < 3:
+            return usage()
+        return cmd_call(argv[2], argv[3:])
+    return usage()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        stop_child(signal.SIGINT, None)
